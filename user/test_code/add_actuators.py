@@ -54,6 +54,9 @@ def design_scene() -> list[list[float]]:
     # Return the origins
     return origin
 
+def run_simulators():
+    
+
 
 def main():
     """Main function."""
