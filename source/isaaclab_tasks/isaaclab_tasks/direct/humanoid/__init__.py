@@ -12,7 +12,8 @@ import gymnasium as gym
 from . import agents
 
 from .h1_env import H1Env, H1EnvCfg
-from .balance_robot_env import BalanceRobotEnv, BalanceRobotEnvCfg
+from .balance_robot_env import BalanceRobotEnv
+from .balance_robot_env_cfg import CODBipedalFlatEnvCfg, CODBipedalFlatEnvCfg_PLAY
 
 ##
 # Register Gym environments.
@@ -44,11 +45,23 @@ gym.register(
 
 
 gym.register(
-    id="Isaac-Bipedal-Direct-v0",
-    entry_point="isaaclab_tasks.direct.humanoid:BalanceRobotEnv",
+    id="Isaac-COD-Bipedal-Flat-v0",
+    entry_point=f"{__name__}.balance_robot_env:BalanceRobotEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": BalanceRobotEnvCfg,
+        "env_cfg_entry_point": CODBipedalFlatEnvCfg,
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HumanoidPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="Isaac-COD-Bipedal-Flat-Play-v0",
+    entry_point=f"{__name__}.balance_robot_env:BalanceRobotEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": CODBipedalFlatEnvCfg_PLAY,
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HumanoidPPORunnerCfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",

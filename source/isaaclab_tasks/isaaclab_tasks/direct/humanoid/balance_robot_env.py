@@ -20,12 +20,32 @@ import sys
 import os
 import numpy as np
 
-# 添加user/test_code到路径以便导入VMC
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../../..'))
-from user.test_code.test_robot_jointsNsensors import quat_to_euler
-from user.test_code.VMC import VMCSolver
+# 添加IsaacLab根目录到路径以便导入user模块
+_isaaclab_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.."))
+if _isaaclab_root not in sys.path:
+    sys.path.insert(0, _isaaclab_root)
 
-from .balance_robot_env_cfg import BalanceRobotEnvCfg
+from .VMC import VMCSolver
+
+from .balance_robot_env_cfg import LocomotionBipedalEnvCfg
+
+def quat_to_euler(quat: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = quat.unbind(-1)
+
+    t0 = 2.0 * (w * x + y * z)
+    t1 = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(t0, t1)
+
+    t2 = 2.0 * (w * y - z * x)
+    t2 = torch.clamp(t2, -1.0, 1.0)
+    pitch = torch.asin(t2)
+
+    t3 = 2.0 * (w * z + x * y)
+    t4 = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(t3, t4)
+
+    return torch.stack((roll, pitch, yaw), dim=-1)
+
 
 
 class BalanceRobotEnv(DirectRLEnv):
@@ -33,23 +53,25 @@ class BalanceRobotEnv(DirectRLEnv):
     
     任务目标：控制平衡机器人保持直立并可能移动
     """
-    cfg: BalanceRobotEnvCfg
+    cfg: LocomotionBipedalEnvCfg
 
-    def __init__(self, cfg: BalanceRobotEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: LocomotionBipedalEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        # TODO: 根据你的实际关节名称获取关节索引
-        # 方法1: 如果你知道确切的关节名称
+        # 获取控制的关节索引
         self._left_front_idx, _ = self.robot.find_joints("Left_front_joint")
         self._left_rear_idx, _ = self.robot.find_joints("Left_rear_joint")
         self._right_front_idx, _ = self.robot.find_joints("Right_front_joint")
         self._right_rear_idx, _ = self.robot.find_joints("Right_rear_joint")
         self._left_wheel_idx, _ = self.robot.find_joints("Left_Wheel_joint")
         self._right_wheel_idx, _ = self.robot.find_joints("Right_Wheel_joint")
+        
+        # 将索引展平成一维列表
         self._controlled_joint_indices = [
-            self._left_front_idx, self._left_rear_idx,
-            self._right_front_idx, self._right_rear_idx,
-            self._left_wheel_idx, self._right_wheel_idx]
+            self._left_front_idx[0], self._left_rear_idx[0],
+            self._right_front_idx[0], self._right_rear_idx[0],
+            self._left_wheel_idx[0], self._right_wheel_idx[0]
+        ]
 
         # ['Left_front_joint', 'Left_rear_joint', 'Right_front_joint', 
         #                       'Right_rear_joint', 'Left_Wheel_joint', 'Right_Wheel_joint']
@@ -77,21 +99,23 @@ class BalanceRobotEnv(DirectRLEnv):
 
     def _setup_scene(self):
         """设置场景"""
+        # 创建地形
+        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        self.terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+        
         # 创建机器人
         self.robot = Articulation(self.cfg.robot)
         
-        # 添加地面
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # 将机器人添加到场景（必须在克隆之前）
+        self.scene.articulations["robot"] = self.robot
         
         # 克隆和复制环境
         self.scene.clone_environments(copy_from_source=False)
         
         # CPU仿真需要显式过滤碰撞
         if self.device == "cpu":
-            self.scene.filter_collisions(global_prim_paths=[])
-        
-        # 将机器人添加到场景
-        self.scene.articulations["robot"] = self.robot
+            self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
         
         # 添加光照
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -106,15 +130,11 @@ class BalanceRobotEnv(DirectRLEnv):
         # 将神经网络输出的动作（通常在[-1, 1]范围）缩放到实际扭矩
         scaled_actions = self.actions * self.cfg.action_scale
         
-        # TODO: 根据你的控制方案修改
-        # 方案1: 控制所有关节
-        self.robot.set_joint_effort_target(scaled_actions)
-        
-        # 方案2: 只控制特定关节
-        # self.robot.set_joint_effort_target(
-        #     scaled_actions, 
-        #     joint_ids=self._controlled_joint_indices
-        # )
+        # 只控制特定的6个关节（腿部和轮子）
+        self.robot.set_joint_effort_target(
+            scaled_actions, 
+            joint_ids=self._controlled_joint_indices
+        )
 
     def _get_observations(self) -> dict:
         """获取观察"""
@@ -156,22 +176,22 @@ class BalanceRobotEnv(DirectRLEnv):
         avg_pendulum_length_vel = torch.zeros((self.num_envs, 1), device=self.device)
         
         for env_id in range(self.num_envs):
-            # 获取关节位置
-            left_front_pos = self.joint_pos[env_id, self._left_front_idx].item()
-            right_front_pos = self.joint_pos[env_id, self._right_front_idx].item()
-            left_rear_pos = self.joint_pos[env_id, self._left_rear_idx].item()
-            right_rear_pos = self.joint_pos[env_id, self._right_rear_idx].item()
+            # 获取关节位置（使用索引的第一个元素）
+            left_front_pos = self.joint_pos[env_id, self._controlled_joint_indices[0]].item()
+            left_rear_pos = self.joint_pos[env_id, self._controlled_joint_indices[1]].item()
+            right_front_pos = self.joint_pos[env_id, self._controlled_joint_indices[2]].item()
+            right_rear_pos = self.joint_pos[env_id, self._controlled_joint_indices[3]].item()
 
-            left_4_vel = self.joint_vel[env_id, self._left_front_idx].item()
-            right_4_vel = self.joint_vel[env_id, self._right_front_idx].item()
-            left_1_vel = self.joint_vel[env_id, self._left_rear_idx].item()
-            right_1_vel = self.joint_vel[env_id, self._right_rear_idx].item()
+            left_front_vel = self.joint_vel[env_id, self._controlled_joint_indices[0]].item()
+            left_rear_vel = self.joint_vel[env_id, self._controlled_joint_indices[1]].item()
+            right_front_vel = self.joint_vel[env_id, self._controlled_joint_indices[2]].item()
+            right_rear_vel = self.joint_vel[env_id, self._controlled_joint_indices[3]].item()
             
             # 使用VMC求解器计算,反过来
             self.left_vmc_solvers[env_id].Resolve(math.pi + right_rear_pos, -right_front_pos)
             self.right_vmc_solvers[env_id].Resolve(math.pi - left_rear_pos, left_front_pos)
-            left_leg_vel, left_theta_vel = self.left_vmc_solvers[env_id].VMCVelCal(np.array([right_1_vel, -right_4_vel]))
-            right_leg_vel, right_theta_vel = self.right_vmc_solvers[env_id].VMCVelCal(np.array([-left_1_vel, left_4_vel]))
+            left_leg_vel, left_theta_vel = self.left_vmc_solvers[env_id].VMCVelCal(np.array([right_rear_vel, -right_front_vel]))
+            right_leg_vel, right_theta_vel = self.right_vmc_solvers[env_id].VMCVelCal(np.array([-left_rear_vel, left_front_vel]))
             
             # 获取倒立摆参数
             left_angle = self.left_vmc_solvers[env_id].GetPendulumRadian()
