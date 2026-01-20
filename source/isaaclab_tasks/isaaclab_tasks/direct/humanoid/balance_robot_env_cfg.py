@@ -17,8 +17,8 @@ import isaaclab.sim as sim_utils
 
 
 @configclass
-class BalanceRobotEnvCfg(DirectRLEnvCfg):
-    """平衡机器人强化学习环境配置 - RoboMaster Balance Robot"""
+class LocomotionBipedalEnvCfg(DirectRLEnvCfg):
+    """平衡机器人基础环境配置 - 包含核心观察、动作和奖励参数"""
     
     # env
     episode_length_s = 10.0
@@ -31,15 +31,22 @@ class BalanceRobotEnvCfg(DirectRLEnvCfg):
     # ========== 仿真配置 ==========
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,  # 物理仿真时间步长：120Hz
-        render_interval=decimation  # 渲染间隔
+        render_interval=decimation,  # 渲染间隔
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
     )
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="average",
-            restitution_combine_mode="average",
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
             static_friction=1.0,
             dynamic_friction=1.0,
             restitution=0.0,
@@ -49,22 +56,21 @@ class BalanceRobotEnvCfg(DirectRLEnvCfg):
 
     # ========== 场景配置 ==========
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=1, env_spacing=4.0,  
-        replicate_physics=True, clone_in_fabric=True
+        num_envs=4096, env_spacing=4.0,  
+        replicate_physics=True,
+        clone_in_fabric=True
     )
 
-    # robot
+    # robot configuration
     _current_dir = os.path.dirname(os.path.abspath(__file__))
     _usd_path = os.path.abspath(
-        os.path.join(_current_dir, "../../../../../../../user/usd_file/USD/COD-2026RoboMaster-Balance.usd")
+        os.path.join(_current_dir, "../../../../../user/usd_file/USD/Only_Robot.usd")
     )
     
     robot: ArticulationCfg = ArticulationCfg(
-        prim_path="/World/envs/env_.*/Robot",  # 机器人在场景中的路径
-        
+        prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
             usd_path=_usd_path,
-            
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
                 max_linear_velocity=1000.0,
@@ -72,16 +78,13 @@ class BalanceRobotEnvCfg(DirectRLEnvCfg):
                 max_depenetration_velocity=100.0,
                 enable_gyroscopic_forces=True,
             ),
-            
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False,
                 solver_position_iteration_count=4,
                 solver_velocity_iteration_count=1,
             ),
-            
             activate_contact_sensors=True,
         ),
-        
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.0, 0.5),
         ),
@@ -95,10 +98,11 @@ class BalanceRobotEnvCfg(DirectRLEnvCfg):
         },
     )
 
-    # target velocity
+    # target velocity range
     target_velocity_range: tuple[float, float] = (-1.0, 1.0)
 
-    # reward scales
+    # ========== 奖励权重配置 ==========
+    # 1. 存活奖励
     rew_scale_alive = 1.0
 
     # 2. 腿摆角和摆角速度惩罚
@@ -128,18 +132,42 @@ class BalanceRobotEnvCfg(DirectRLEnvCfg):
     # 7. 能量消耗：惩罚大扭矩
     rew_scale_torque = -0.0001
     
-    # termination
+    # ========== 终止条件 ==========
     max_tilt_angle: float = 0.5
     max_position: float = 10.0
     
-    # reset
+    # ========== 重置配置 ==========
     initial_tilt_range: tuple[float, float] = (-0.1, 0.1)
     initial_joint_pos_range: tuple[float, float] = (-0.1, 0.1)
 
 
 @configclass
-class BalanceRobotEnvCfg_PLAY(BalanceRobotEnvCfg):
+class CODBipedalFlatEnvCfg(LocomotionBipedalEnvCfg):
+    """COD平衡机器人平地环境配置"""
+    
     def __post_init__(self):
+        """Post initialization - 针对平地环境的参数调整"""
+        super().__post_init__()
+        
+        # 平地环境可以用更多环境并行训练
+        self.scene.num_envs = 24
+        self.scene.env_spacing = 4.0
+        
+        # 平地上可以训练更久一些
+        self.episode_length_s = 15.0
+        
+        # 平地上摩擦力设置
+        self.sim.physics_material.static_friction = 1.0
+        self.sim.physics_material.dynamic_friction = 1.0
+
+
+@configclass
+class CODBipedalFlatEnvCfg_PLAY(CODBipedalFlatEnvCfg):
+    """COD平衡机器人平地环境 - Play模式配置"""
+    
+    def __post_init__(self):
+        super().__post_init__()
+        # Play模式只用一个环境
         self.scene.num_envs = 1
         self.scene.env_spacing = 2.5
         self.episode_length_s = 20.0

@@ -20,12 +20,29 @@ import sys
 import os
 import numpy as np
 
-# 添加user/test_code到路径以便导入VMC
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../../..'))
-from user.test_code.test_robot_jointsNsensors import quat_to_euler
-from user.test_code.VMC import VMCSolver
+# 添加IsaacLab根目录到路径以便导入user模块
 
-from .balance_robot_env_cfg import BalanceRobotEnvCfg
+from .VMC import VMCSolver
+
+from .balance_robot_env_cfg import LocomotionBipedalEnvCfg
+
+def quat_to_euler(quat: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = quat.unbind(-1)
+
+    t0 = 2.0 * (w * x + y * z)
+    t1 = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(t0, t1)
+
+    t2 = 2.0 * (w * y - z * x)
+    t2 = torch.clamp(t2, -1.0, 1.0)
+    pitch = torch.asin(t2)
+
+    t3 = 2.0 * (w * z + x * y)
+    t4 = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(t3, t4)
+
+    return torch.stack((roll, pitch, yaw), dim=-1)
+
 
 
 class BalanceRobotEnv(DirectRLEnv):
@@ -33,33 +50,24 @@ class BalanceRobotEnv(DirectRLEnv):
     
     任务目标：控制平衡机器人保持直立并可能移动
     """
-    cfg: BalanceRobotEnvCfg
+    cfg: LocomotionBipedalEnvCfg
 
-    def __init__(self, cfg: BalanceRobotEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: LocomotionBipedalEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         # TODO: 根据你的实际关节名称获取关节索引
-        # 方法1: 如果你知道确切的关节名称
         self._left_front_idx, _ = self.robot.find_joints("Left_front_joint")
         self._left_rear_idx, _ = self.robot.find_joints("Left_rear_joint")
         self._right_front_idx, _ = self.robot.find_joints("Right_front_joint")
         self._right_rear_idx, _ = self.robot.find_joints("Right_rear_joint")
         self._left_wheel_idx, _ = self.robot.find_joints("Left_Wheel_joint")
         self._right_wheel_idx, _ = self.robot.find_joints("Right_Wheel_joint")
+        # 展平索引列表（find_joints返回列表，需要取第一个元素）
         self._controlled_joint_indices = [
-            self._left_front_idx, self._left_rear_idx,
-            self._right_front_idx, self._right_rear_idx,
-            self._left_wheel_idx, self._right_wheel_idx]
+            self._left_front_idx[0], self._left_rear_idx[0],
+            self._right_front_idx[0], self._right_rear_idx[0],
+            self._left_wheel_idx[0], self._right_wheel_idx[0]]
 
-        # ['Left_front_joint', 'Left_rear_joint', 'Right_front_joint', 
-        #                       'Right_rear_joint', 'Left_Wheel_joint', 'Right_Wheel_joint']
-        
-        # 方法2: 获取所有关节（如果所有关节都要控制）
-        # self._controlled_joint_indices = list(range(self.robot.num_joints))
-        
-        # 临时：获取所有关节索引（你需要根据实际情况修改）
-        # self._controlled_joint_indices = list(range(self.cfg.action_space))
-        
         # 缓存关节数据引用
         self.joint_pos = self.robot.data.joint_pos
         self.joint_vel = self.robot.data.joint_vel
@@ -106,15 +114,11 @@ class BalanceRobotEnv(DirectRLEnv):
         # 将神经网络输出的动作（通常在[-1, 1]范围）缩放到实际扭矩
         scaled_actions = self.actions * self.cfg.action_scale
         
-        # TODO: 根据你的控制方案修改
-        # 方案1: 控制所有关节
-        self.robot.set_joint_effort_target(scaled_actions)
-        
-        # 方案2: 只控制特定关节
-        # self.robot.set_joint_effort_target(
-        #     scaled_actions, 
-        #     joint_ids=self._controlled_joint_indices
-        # )
+        # 只控制指定的6个关节（对应action_space=6）
+        self.robot.set_joint_effort_target(
+            scaled_actions, 
+            joint_ids=self._controlled_joint_indices
+        )
 
     def _get_observations(self) -> dict:
         """获取观察"""
@@ -307,13 +311,13 @@ class BalanceRobotEnv(DirectRLEnv):
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         """重置指定环境"""
-        if env_ids is None:
+        if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self.robot._ALL_INDICES
         
+        # 重要：先重置机器人（清除缓存）
+        self.robot.reset(env_ids)
         super()._reset_idx(env_ids)
 
-        # TODO: 根据需要自定义重置逻辑
-        
         # 1. 重置关节状态（添加随机化）
         joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
@@ -326,17 +330,15 @@ class BalanceRobotEnv(DirectRLEnv):
             device=self.device,
         )
         
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-        
         # 2. 重置根状态（添加姿态随机化）
         root_state = self.robot.data.default_root_state[env_ids].clone()
+        # 给位置加上各环境的偏移（default_root_state 是相对于环境原点的）
+        root_state[:, :3] += self.scene.env_origins[env_ids]
         
-        # 给初始姿态添加小的随机扰动
-        # 这里简化处理，实际可能需要更复杂的四元数操作
-        # TODO: 如果需要姿态随机化，需要实现四元数的随机旋转
-        
-        self.robot.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
-        self.robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids=env_ids)
+        # 按标准方式分别写入根状态和关节状态
+        self.robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         
         # 3. 重置动作缓存
         self.previous_actions[env_ids] = 0.0
