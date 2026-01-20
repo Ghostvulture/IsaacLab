@@ -82,12 +82,31 @@ class LocomotionBipedalEnvCfg(DirectRLEnvCfg):
                 enabled_self_collisions=False,
                 solver_position_iteration_count=4,
                 solver_velocity_iteration_count=1,
+                fix_root_link=False,  # 确保根链接可以移动
             ),
             activate_contact_sensors=True,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.5),
+            pos=(0.0, 0.0, 0.6),  # 相对于环境原点的位置
+            rot=(1.0, 0.0, 0.0, 0.0),  # 四元数 (w, x, y, z)
+            joint_pos={
+                "Left_front_joint": 0.0,   
+                "Left_rear_joint": 0.0,    
+                "Right_front_joint": 0.0,  
+                "Right_rear_joint": 0.0,   
+                "Left_Wheel_joint": 0.0,
+                "Right_Wheel_joint": 0.0,
+            },
+            joint_vel={
+                "Left_front_joint": 0.0,   
+                "Left_rear_joint": 0.0,    
+                "Right_front_joint": 0.0,  
+                "Right_rear_joint": 0.0,   
+                "Left_Wheel_joint": 0.0,
+                "Right_Wheel_joint": 0.0,
+            },
         ),
+        
         actuators={
             "all_joints": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],

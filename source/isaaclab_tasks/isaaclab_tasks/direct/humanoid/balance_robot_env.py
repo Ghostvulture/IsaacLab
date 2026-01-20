@@ -314,15 +314,32 @@ class BalanceRobotEnv(DirectRLEnv):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self.robot._ALL_INDICES
         
-        # 重要：先重置机器人（清除缓存）
+        # 1. 先调用 robot.reset() 清除缓存
         self.robot.reset(env_ids)
+        
+        # 2. 调用父类的 _reset_idx
         super()._reset_idx(env_ids)
-
-        # 1. 重置关节状态（添加随机化）
+        
+        # 3. 如果是全部环境重置，设置随机初始episode长度（避免同时重置）
+        if len(env_ids) == self.num_envs:
+            self.episode_length_buf[:] = torch.randint_like(
+                self.episode_length_buf, high=int(self.max_episode_length)
+            )
+        
+        # 4. 重置动作缓存
+        self.previous_actions[env_ids] = 0.0
+        
+        # 5. 随机化目标速度
+        self.target_velocity[env_ids] = sample_uniform(
+            self.cfg.target_velocity_range[0],
+            self.cfg.target_velocity_range[1],
+            (len(env_ids),),
+            device=self.device,
+        )
+        
+        # 6. 准备关节状态（添加随机化）
         joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
-        
-        # 给关节位置添加小的随机扰动
         joint_pos += sample_uniform(
             self.cfg.initial_joint_pos_range[0],
             self.cfg.initial_joint_pos_range[1],
@@ -330,23 +347,19 @@ class BalanceRobotEnv(DirectRLEnv):
             device=self.device,
         )
         
-        # 2. 重置根状态（添加姿态随机化）
-        root_state = self.robot.data.default_root_state[env_ids].clone()
-        # 给位置加上各环境的偏移（default_root_state 是相对于环境原点的）
-        root_state[:, :3] += self.scene.env_origins[env_ids]
+        # 7. 准备根状态（加上环境偏移）
+        default_root_state = self.robot.data.default_root_state[env_ids].clone()
         
-        # 按标准方式分别写入根状态和关节状态
-        self.robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
-        self.robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
+        # 调试输出
+        print(f"\n重置环境 {env_ids.tolist()}")
+        print(f"default_root_state (相对): {default_root_state[:, :3]}")
+        print(f"env_origins: {self.scene.env_origins[env_ids]}")
+        
+        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+        
+        print(f"default_root_state (绝对): {default_root_state[:, :3]}")
+        
+        # 8. 写入状态到仿真器（关键：这个顺序很重要！）
+        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-        
-        # 3. 重置动作缓存
-        self.previous_actions[env_ids] = 0.0
-        
-        # 4. 随机化目标速度（从target_velocity_range范围内采样）
-        self.target_velocity[env_ids] = sample_uniform(
-            self.cfg.target_velocity_range[0],
-            self.cfg.target_velocity_range[1],
-            (len(env_ids),),
-            device=self.device,
-        )
