@@ -15,6 +15,8 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaacsim.core.utils.torch.rotations import compute_rot, quat_conjugate, quat_rotate_inverse
+
 from isaaclab.utils.math import sample_uniform
 import sys
 import os
@@ -24,7 +26,7 @@ import numpy as np
 
 from .VMC import VMCSolver
 
-from .balance_robot_env_cfg import LocomotionBipedalEnvCfg
+from .balance_robot_env_cfg import WbrRLEnvCfg
 
 def quat_to_euler(quat: torch.Tensor) -> torch.Tensor:
     w, x, y, z = quat.unbind(-1)
@@ -45,321 +47,342 @@ def quat_to_euler(quat: torch.Tensor) -> torch.Tensor:
 
 
 
-class BalanceRobotEnv(DirectRLEnv):
-    """平衡机器人强化学习环境
-    
-    任务目标：控制平衡机器人保持直立并可能移动
-    """
-    cfg: LocomotionBipedalEnvCfg
+class WbrRLEnv(DirectRLEnv):
+    cfg: WbrRLEnvCfg
 
-    def __init__(self, cfg: LocomotionBipedalEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: WbrRLEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        # TODO: 根据你的实际关节名称获取关节索引
-        self._left_front_idx, _ = self.robot.find_joints("Left_front_joint")
-        self._left_rear_idx, _ = self.robot.find_joints("Left_rear_joint")
-        self._right_front_idx, _ = self.robot.find_joints("Right_front_joint")
-        self._right_rear_idx, _ = self.robot.find_joints("Right_rear_joint")
-        self._left_wheel_idx, _ = self.robot.find_joints("Left_Wheel_joint")
-        self._right_wheel_idx, _ = self.robot.find_joints("Right_Wheel_joint")
-        # 展平索引列表（find_joints返回列表，需要取第一个元素）
-        self._controlled_joint_indices = [
-            self._left_front_idx[0], self._left_rear_idx[0],
-            self._right_front_idx[0], self._right_rear_idx[0],
-            self._left_wheel_idx[0], self._right_wheel_idx[0]]
+        self.action_scale = self.cfg.action_scale
+        self.joint_gears = torch.tensor(self.cfg.joint_gears, dtype=torch.float32, device=self.sim.device)
+        
+        # ----------------------------------------------------------------------
+        # 1. Joint & Body Indexing
+        # ----------------------------------------------------------------------
+        self.wheel_joint_names = ["Left_Wheel_joint", "Right_Wheel_joint"]
+        self.leg_joint_names = ["Left_front_joint", "Left_rear_joint", "Right_front_joint", "Right_rear_joint"]
+        
+        # Get Global Robot DOF Indices (returns python list[int])
+        wheel_indices_list, _ = self.robot.find_joints(self.wheel_joint_names)
+        leg_indices_list, _ = self.robot.find_joints(self.leg_joint_names)
+        
+        # Convert to Tensors for torch operations
+        self.wheel_dof_indices = torch.tensor(wheel_indices_list, device=self.device)
+        self.leg_dof_indices = torch.tensor(leg_indices_list, device=self.device)
+        
+        # Combined indices for mapping Actions -> Robot Joints
+        self._joint_dof_idx = torch.cat((self.leg_dof_indices, self.wheel_dof_indices))
 
-        # 缓存关节数据引用
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
+        # === Action Vector Indices ===
+        # Since we concatenated (Legs, Wheels) in _joint_dof_idx, the action vector 
+        # follows the same order: [Leg1, Leg2, Leg3, Leg4, Wheel1, Wheel2]
+        num_legs = len(self.leg_dof_indices)
+        num_wheels = len(self.wheel_dof_indices)
         
-        # 用于计算动作平滑奖励
-        self.previous_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
+        # Indices to slice the 'self.actions' tensor
+        self.leg_action_indices = torch.arange(num_legs, device=self.device)
+        self.wheel_action_indices = torch.arange(num_wheels, device=self.device) + num_legs
         
-        # 初始化VMC求解器 - 每个环境一个左右VMC
-        # 参数需要根据实际机器人调整
-        self.left_vmc_solvers = [VMCSolver() for _ in range(self.num_envs)]
-        self.right_vmc_solvers = [VMCSolver() for _ in range(self.num_envs)]
+        # Find indices for Feet/Wheels bodies (using correct case "link")
+        self.left_foot_body_idx, _ = self.robot.find_bodies("Left_Wheel_link") 
+        self.right_foot_body_idx, _ = self.robot.find_bodies("Right_Wheel_link")
         
-        # 初始化目标速度（每个环境一个）
-        self.target_velocity = torch.zeros(self.num_envs, device=self.device)
+        # ----------------------------------------------------------------------
+        # 2. Buffers for History & Commands
+        # ----------------------------------------------------------------------
+        # Commands: [v_x, v_y, omega_z, target_height]
+        self.commands = torch.zeros(self.num_envs, 4, device=self.device)
+        self.command_timer = torch.zeros(self.num_envs, device=self.device)
+        
+        # History buffers
+        # FIX: last_actions must match the size of self.actions (actuated joints only), NOT joint_pos
+        self.last_actions = torch.zeros(self.num_envs, len(self._joint_dof_idx), device=self.device)
+        
+        # last_dof_vel matches full robot joint state (for calculating accelerations)
+        self.last_dof_vel = torch.zeros_like(self.robot.data.joint_vel)
+        
+        self.base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.projected_gravity = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # Link state buffers
+        self.left_foot_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self.right_foot_pos = torch.zeros(self.num_envs, 3, device=self.device)
+
+        # ----------------------------------------------------------------------
+        # 3. Config Parsing
+        # ----------------------------------------------------------------------
+        self.reward_cfg = getattr(self.cfg, "reward_params", {
+            "tracking_linx_sigma": 0.25,
+            "tracking_liny_sigma": 0.25,
+            "tracking_ang_sigma": 0.25,
+            "tracking_height_sigma": 0.1,
+            "feet_distance": [0.2, 0.5], # [min, max]
+            "tracking_gravity_sigma": 0.1
+        })
+        self.command_cfg = getattr(self.cfg, "command_params", {
+            "zero_stable": True,
+            "resampling_time": 4.0
+        })
 
     def _setup_scene(self):
-        """设置场景"""
-        # 创建机器人
         self.robot = Articulation(self.cfg.robot)
-        
-        # 添加地面
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        
-        # 克隆和复制环境
+        # add ground plane
+        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        self.terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+        # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
-        
-        # CPU仿真需要显式过滤碰撞
+        # filter collisions
         if self.device == "cpu":
-            self.scene.filter_collisions(global_prim_paths=[])
-        
-        # 将机器人添加到场景
+            self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
         self.scene.articulations["robot"] = self.robot
-        
-        # 添加光照
+        # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-    def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """在物理步进前处理动作"""
+    def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = actions.clone()
+        # Resample commands if needed
+        self._resample_commands()
 
-    def _apply_action(self) -> None:
-        """应用动作到机器人"""
-        # 将神经网络输出的动作（通常在[-1, 1]范围）缩放到实际扭矩
-        scaled_actions = self.actions * self.cfg.action_scale
+    def _apply_action(self):
+        # Store history before step
+        self.last_dof_vel[:] = self.robot.data.joint_vel[:]
+        self.last_actions[:] = self.actions[:]
         
-        # 只控制指定的6个关节（对应action_space=6）
-        self.robot.set_joint_effort_target(
-            scaled_actions, 
-            joint_ids=self._controlled_joint_indices
-        )
+        # Apply Torques
+        forces = self.action_scale * self.joint_gears * self.actions
+        self.robot.set_joint_effort_target(forces, joint_ids=self._joint_dof_idx)
 
-    def _get_observations(self) -> dict:
-        """获取观察"""
+    def _resample_commands(self):
+        """Randomly sample velocity and height commands."""
+        dt = self.cfg.sim.dt * self.cfg.decimation
+        self.command_timer += dt
         
-        # TODO: 根据你的需求构建观察向量
-        # 以下是一个示例，包含IMU数据和关节状态
+        # Mask for envs that need new commands
+        resample_mask = self.command_timer >= self.command_cfg["resampling_time"]
+        resample_ids = resample_mask.nonzero(as_tuple=False).flatten()
         
-        obs_list = []
-
-        # 观察空间包含：
-        # - 虚拟IMU数据: RPY(3) + 角速度(3) = 6
-        #   (直接从robot.data获取，无需独立IMU传感器)
-        # - VMC数据: 双腿摆角(1) + 摆角速度(1) + 腿长(1) + 腿长速度(1) = 4
-        # - 位置和速度: X位置(1) + X速度(1) = 2
-        # - 目标速度: (1)
-        # 总计: 6 + 4 + 2 + 1 = 13维
-        
-        # 1. 虚拟IMU数据（6维）- Go2方式
-        # RPY (3) - 从机器人根部姿态四元数计算
-        quat_copy = self.robot.data.root_quat_w  # 世界坐标系四元数
-        rpy = quat_to_euler(quat_copy)
-        obs_list.append(rpy)
-        # 角速度 (3) - 相当于陀螺仪
-        ang_vel = self.robot.data.root_ang_vel_b  # body frame角速度
-        obs_list.append(ang_vel)
-        
-        # 保存RPY和角速度供reward函数使用
-        self.roll = rpy[:, 0]      # [num_envs]
-        self.pitch = rpy[:, 1]     # [num_envs]
-        self.yaw = rpy[:, 2]       # [num_envs]
-        self.ang_vel_x = ang_vel[:, 0]  # [num_envs]
-        self.ang_vel_y = ang_vel[:, 1]  # [num_envs]
-        self.ang_vel_z = ang_vel[:, 2]  # [num_envs]
-        
-        # 2. VMC数据：计算双腿摆角和长度的平均值 (2维)
-        avg_pendulum_angle = torch.zeros((self.num_envs, 1), device=self.device)
-        avg_pendulum_length = torch.zeros((self.num_envs, 1), device=self.device)
-        avg_pendulum_angle_vel = torch.zeros((self.num_envs, 1), device=self.device)
-        avg_pendulum_length_vel = torch.zeros((self.num_envs, 1), device=self.device)
-        
-        for env_id in range(self.num_envs):
-            # 获取关节位置
-            left_front_pos = self.joint_pos[env_id, self._left_front_idx].item()
-            right_front_pos = self.joint_pos[env_id, self._right_front_idx].item()
-            left_rear_pos = self.joint_pos[env_id, self._left_rear_idx].item()
-            right_rear_pos = self.joint_pos[env_id, self._right_rear_idx].item()
-
-            left_4_vel = self.joint_vel[env_id, self._left_front_idx].item()
-            right_4_vel = self.joint_vel[env_id, self._right_front_idx].item()
-            left_1_vel = self.joint_vel[env_id, self._left_rear_idx].item()
-            right_1_vel = self.joint_vel[env_id, self._right_rear_idx].item()
+        if len(resample_ids) > 0:
+            # Vx (Forward)
+            self.commands[resample_ids, 0] = sample_uniform(-1.0, 1.0, (len(resample_ids),), device=self.device)
+            # Vy (Lateral)
+            self.commands[resample_ids, 1] = sample_uniform(-0.5, 0.5, (len(resample_ids),), device=self.device)
+            # Omega Z (Yaw)
+            self.commands[resample_ids, 2] = sample_uniform(-1.5, 1.5, (len(resample_ids),), device=self.device)
+            # Height (Z) - Adjust range based on your robot size
+            self.commands[resample_ids, 3] = sample_uniform(0.1, 0.4, (len(resample_ids),), device=self.device)
             
-            # 使用VMC求解器计算,反过来
-            self.left_vmc_solvers[env_id].Resolve(math.pi + right_rear_pos, -right_front_pos)
-            self.right_vmc_solvers[env_id].Resolve(math.pi - left_rear_pos, left_front_pos)
-            left_leg_vel, left_theta_vel = self.left_vmc_solvers[env_id].VMCVelCal(np.array([right_1_vel, -right_4_vel]))
-            right_leg_vel, right_theta_vel = self.right_vmc_solvers[env_id].VMCVelCal(np.array([-left_1_vel, left_4_vel]))
-            
-            # 获取倒立摆参数
-            left_angle = self.left_vmc_solvers[env_id].GetPendulumRadian()
-            right_angle = self.right_vmc_solvers[env_id].GetPendulumRadian()
-            left_length = self.left_vmc_solvers[env_id].GetPendulumLen()
-            right_length = self.right_vmc_solvers[env_id].GetPendulumLen()            
-            
-            # 计算平均值
-            avg_pendulum_angle[env_id, 0] = (left_angle + right_angle) / 2.0
-            avg_pendulum_length[env_id, 0] = (left_length + right_length) / 2.0
-            avg_pendulum_angle_vel[env_id, 0] = (left_theta_vel + right_theta_vel) / 2.0
-            avg_pendulum_length_vel[env_id, 0] = (left_leg_vel + right_leg_vel) / 2.0
-        
-        obs_list.append(avg_pendulum_angle)
-        obs_list.append(avg_pendulum_length)
-        obs_list.append(avg_pendulum_angle_vel)
-        obs_list.append(avg_pendulum_length_vel)
+            if self.command_cfg["zero_stable"]:
+                zero_mask = torch.rand(len(resample_ids), device=self.device) < 0.2
+                self.commands[resample_ids[zero_mask], :3] = 0.0
 
+            self.command_timer[resample_ids] = 0.0
+
+    def _get_observations(self) -> dict: 
+        # 1. Base State
+        root_quat = self.robot.data.root_quat_w
+        root_lin_vel_w = self.robot.data.root_lin_vel_w
+        root_ang_vel_w = self.robot.data.root_ang_vel_w
         
-        # 保存VMC参数供奖励函数使用
-        self.avg_pendulum_angle = avg_pendulum_angle.squeeze(-1)  # [num_envs]
-        self.avg_pendulum_length = avg_pendulum_length.squeeze(-1)  # [num_envs]
-        self.avg_pendulum_angle_vel = avg_pendulum_angle_vel.squeeze(-1)  # [num_envs]
-        self.avg_pendulum_length_vel = avg_pendulum_length_vel.squeeze(-1)  # [num_envs]
+        # Convert World Velocity to Body Frame
+        self.base_lin_vel = quat_rotate_inverse(root_quat, root_lin_vel_w)
+        self.base_ang_vel = quat_rotate_inverse(root_quat, root_ang_vel_w)
         
-        # 3. X and V
-        obs_list.append(self.robot.data.root_pos_w[:, 0:1])  # X position
-        obs_list.append(self.robot.data.root_lin_vel_w[:, 0:1])  # X velocity
+        # Projected Gravity (Global [0,0,-1] in Body Frame)
+        gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=self.device).repeat(self.num_envs, 1)
+        self.projected_gravity = quat_rotate_inverse(root_quat, gravity_vec)
+
+        # 2. Joint State
+        self.dof_pos = self.robot.data.joint_pos
+        self.dof_vel = self.robot.data.joint_vel
         
-        # 保存X速度供奖励函数使用
-        self.x_velocity = self.robot.data.root_lin_vel_w[:, 0]  # [num_envs]
-        
-        # 4. 目标速度
-        obs_list.append(self.target_velocity.unsqueeze(-1))  # [num_envs, 1]
-        
-        # 拼接所有观察
-        obs = torch.cat(obs_list, dim=-1)
-        
-        # 确保观察维度正确
-        assert obs.shape[1] == self.cfg.observation_space, (
-            f"观察维度不匹配！期望 {self.cfg.observation_space}，实际 {obs.shape[1]}"
+        # 3. Feet Positions (for rewards)
+        if len(self.left_foot_body_idx) > 0:
+             self.left_foot_pos = self.robot.data.body_pos_w[:, self.left_foot_body_idx[0], :]
+             self.right_foot_pos = self.robot.data.body_pos_w[:, self.right_foot_body_idx[0], :]
+
+        # 4. Construct Observation Vector
+        obs = torch.cat(
+            (
+                self.base_lin_vel * 2.0,      # Scale for network stability
+                self.base_ang_vel * 0.25,
+                self.projected_gravity,
+                self.commands * 2.0,          # [vx, vy, wz, h]
+                (self.dof_pos - self.robot.data.default_joint_pos) * 1.0,
+                torch.clamp(self.dof_vel * 0.05, -5.0, 5.0),  # Clamp to prevent explosion
+                self.actions                  # Last actions
+            ),
+            dim=-1,
         )
         
-        observations = {"policy": obs}
-        return observations
+        return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        """计算奖励"""
+        # 1. Tracking
+        rew_lin_x = self._reward_tracking_lin_x_vel()
+        rew_lin_y = self._reward_tracking_lin_y_vel()
+        rew_ang_z = self._reward_tracking_ang_vel()
+        rew_height = self._reward_tracking_leg_length()
         
-        # TODO: 根据你的任务目标设计奖励函数
-        # 以下是一些常见的奖励项示例
+        # 2. Stability / Penalties
+        rew_lin_z = self._reward_lin_vel_z()
+        rew_ang_xy = self._reward_ang_vel_xy()
+        rew_projected_gravity = self._reward_projected_gravity()
         
-        total_reward = torch.zeros(self.num_envs, device=self.device)
+        # 3. Action / Smoothness
+        rew_joint_acc = self._reward_joint_action_rate() 
+        rew_wheel_acc = self._reward_reward_wheel_action_rate()
+        rew_dof_acc = self._reward_dof_acc()
+        rew_dof_vel = self._reward_joint_vel()
         
-        # 1. 存活奖励：每步都给予，鼓励机器人保持不倒
-        total_reward += self.cfg.rew_scale_alive
-        
-        # 2. 腿摆角奖励：鼓励保持目标摆角
-        target_leg_angle = 1.57  # 目标摆角（约90度）
-        
-        # theta and theta_dot
-        leg_angle_error = torch.abs(self.avg_pendulum_angle - target_leg_angle)
-        leg_angle_vel_error = torch.abs(self.avg_pendulum_angle_vel)
-        total_reward -= self.cfg.rew_scale_leg_angle * leg_angle_error
-        total_reward -= self.cfg.rew_scale_leg_angle_vel * leg_angle_vel_error
-        
-        # 3. pitch and pitch_dot
-        pitch_diff = torch.abs(self.pitch)
-        pitch_vel_diff = torch.abs(self.ang_vel_y)
-        total_reward -= self.cfg.rew_scale_upright * pitch_diff
-        total_reward -= self.cfg.rew_scale_upright_vel * pitch_vel_diff
-        
-        # 4. 速度跟随奖励：鼓励跟随目标速度
-        velocity_error = torch.abs(self.x_velocity - self.target_velocity)
-        total_reward -= self.cfg.rew_scale_velocity_tracking * velocity_error
-        
-        # 5. 速度惩罚：惩罚过大的线速度和角速度
-        lin_vel_penalty = -torch.sum(self.robot.data.root_lin_vel_w ** 2, dim=-1)
-        total_reward += self.cfg.rew_scale_lin_vel * lin_vel_penalty
-        
-        ang_vel_penalty = -torch.sum(self.robot.data.root_ang_vel_w ** 2, dim=-1)
-        total_reward += self.cfg.rew_scale_ang_vel * ang_vel_penalty
-        
-        # 4. 关节速度惩罚：惩罚过大的关节速度
-        joint_vel_penalty = -torch.sum(
-            self.joint_vel[:, self._controlled_joint_indices] ** 2, dim=-1
+        # 4. Constraints
+        rew_collision = self._reward_collision()
+        rew_feet_dist = self._reward_feet_distance()
+        rew_calf_sym = self._reward_similar_calf()
+
+        # Summation (Rewards rescaled to keep total per-step reward around -1 to +1)
+        total_reward = (
+            rew_lin_x * 0.15 +
+            rew_lin_y * 0.10 + 
+            rew_ang_z * 0.08 + 
+            rew_height * 0.12 +
+            # Penalties (Subtracted)
+            rew_projected_gravity * -0.15 +
+            rew_lin_z * -0.25 +
+            rew_ang_xy * -0.05 +
+            rew_joint_acc * -0.005 +
+            rew_wheel_acc * -0.005 +
+            rew_dof_acc * -1.0e-7 + 
+            rew_dof_vel * -0.0005 +
+            rew_collision * -0.1 +
+            rew_calf_sym * -0.08 +
+            rew_feet_dist * -0.1
         )
-        total_reward += self.cfg.rew_scale_joint_vel * joint_vel_penalty
         
-        # 5. 动作平滑奖励：惩罚动作的突变
-        action_rate_penalty = -torch.sum((self.actions - self.previous_actions) ** 2, dim=-1)
-        total_reward += self.cfg.rew_scale_action_rate * action_rate_penalty
-        self.previous_actions[:] = self.actions
-        
-        # 6. 扭矩惩罚：惩罚大扭矩（节能）
-        torque_penalty = -torch.sum(self.actions ** 2, dim=-1)
-        total_reward += self.cfg.rew_scale_torque * torque_penalty
-        
-        # 7. 终止惩罚：如果环境终止（跌倒），给予额外惩罚
-        total_reward += self.cfg.rew_scale_terminated * self.reset_terminated.float()
+        # Apply death cost
+        total_reward = torch.where(
+            self.reset_terminated, 
+            torch.ones_like(total_reward) * self.cfg.death_cost, 
+            total_reward
+        )
         
         return total_reward
 
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """判断是否终止"""
-        
-        # 更新关节状态
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
-        
-        # 1. 超时终止
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        
-        # 2. 跌倒终止：pitch或roll角度过大
-        # 使用已经计算好的RPY角度（从robot.data.root_quat_w计算）
-        pitch = self.pitch
-        roll = self.roll
-        
-        # 如果倾斜角度过大，认为跌倒
-        tipped_over = (torch.abs(pitch) > self.cfg.max_tilt_angle) | \
-                      (torch.abs(roll) > self.cfg.max_tilt_angle)
-        
-        # 3. 位置越界终止：机器人移动太远
-        out_of_bounds = torch.any(
-            torch.abs(self.robot.data.root_pos_w[:, :2]) > self.cfg.max_position, 
-            dim=1
-        )
-        
-        # 组合所有终止条件
-        terminated = tipped_over | out_of_bounds
-        
-        return terminated, time_out
+    # ------------ Custom Reward Implementations ----------------
 
-    def _reset_idx(self, env_ids: Sequence[int] | None):
-        """重置指定环境"""
+    def _reward_tracking_lin_x_vel(self):
+        lin_vel_error = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
+        lin_vel_reward = torch.exp(-lin_vel_error / self.reward_cfg["tracking_linx_sigma"])
+        if self.command_cfg["zero_stable"]:
+            near_zero_mask = (torch.abs(self.commands[:, 0]) <= 0.01)
+            if torch.any(near_zero_mask):
+                second_error = torch.square(self.base_lin_vel[near_zero_mask, 0])
+                second_reward = torch.exp(-second_error / self.reward_cfg["tracking_linx_sigma"])
+                lin_vel_reward[near_zero_mask] += second_reward
+        return lin_vel_reward
+
+    def _reward_tracking_lin_y_vel(self):
+        lin_vel_error = torch.square(self.commands[:, 1] - self.base_lin_vel[:, 1])
+        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_liny_sigma"])
+
+    def _reward_tracking_ang_vel(self):
+        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        ang_vel_reward = torch.exp(-ang_vel_error / self.reward_cfg["tracking_ang_sigma"])
+        return ang_vel_reward
+
+    def _reward_tracking_leg_length(self):
+        # Uses leg joint indices (Indices relative to full robot state)
+        # Note: adjust index offset [1]/[3] if your 'Left_rear_joint' etc order is different
+        knee_error = torch.square(self.dof_pos[:, self.leg_dof_indices[1]] - self.commands[:, 3])
+        knee_error += torch.square(self.dof_pos[:, self.leg_dof_indices[3]] - self.commands[:, 3])
+        return torch.exp(-knee_error / self.reward_cfg["tracking_height_sigma"])
+
+    def _reward_lin_vel_z(self):
+        return torch.square(self.base_lin_vel[:, 2])
+    
+    def _reward_joint_action_rate(self):
+        # FIX: Use 'leg_action_indices' to slice 'actions' (size 6)
+        # NOT 'leg_dof_indices' which are global joint indices (e.g. 5,6,7,8)
+        joint_action_rate = self.last_actions[:, self.leg_action_indices] - self.actions[:, self.leg_action_indices]
+        return torch.sum(torch.square(joint_action_rate), dim=1)
+
+    def _reward_reward_wheel_action_rate(self):
+        # FIX: Use 'wheel_action_indices'
+        wheel_action_rate = self.last_actions[:, self.wheel_action_indices] - self.actions[:, self.wheel_action_indices]
+        return torch.sum(torch.square(wheel_action_rate), dim=1)
+
+    def _reward_projected_gravity(self):
+        reward = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+        return reward
+    
+    def _reward_similar_calf(self):
+        # Uses global joint positions, so 'leg_dof_indices' is correct here
+        rew = torch.square(self.dof_pos[:, self.leg_dof_indices[0]] - self.dof_pos[:, self.leg_dof_indices[2]])
+        return rew
+
+    def _reward_joint_vel(self):
+        # Uses global joint velocities, so 'leg_dof_indices' is correct here
+        return torch.sum(torch.square(self.dof_vel[:, self.leg_dof_indices]), dim=1)
+
+    def _reward_dof_acc(self):
+        dt = self.cfg.sim.dt * self.cfg.decimation
+        dof_acc = (self.dof_vel - self.last_dof_vel) / dt
+        # Clamp acceleration to prevent explosion
+        dof_acc = torch.clamp(dof_acc, -100.0, 100.0)
+        return torch.sum(torch.square(dof_acc), dim=1)
+
+    def _reward_ang_vel_xy(self):
+        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+
+    def _reward_collision(self):
+        data = self.scene.articulations["robot"].data
+        # 向后兼容 IsaacLab 各版本的接触力字段
+        contact_forces = getattr(data, "net_contact_forces", None)
+        if contact_forces is None:
+            contact_forces = getattr(data, "contact_forces", None)
+        if contact_forces is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        force_norm = torch.norm(contact_forces, dim=-1)
+        # Clamp force to prevent explosion
+        force_norm = torch.clamp(force_norm, 0.0, 1000.0)
+        return torch.sum(force_norm.square(), dim=1)
+    
+    def _reward_feet_distance(self):
+        feet_distance = torch.norm(self.left_foot_pos - self.right_foot_pos, dim=-1)
+        reward = torch.clamp(self.reward_cfg["feet_distance"][0] - feet_distance, min=0.0, max=1.0) + \
+                 torch.clamp(feet_distance - self.reward_cfg["feet_distance"][1], min=0.0, max=1.0)
+        return reward
+    
+    def _reward_survive(self):
+        return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        died = self.robot.data.root_pos_w[:, 2] < self.cfg.termination_height
+        return died, time_out
+
+    def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self.robot._ALL_INDICES
-        
-        # 1. 先调用 robot.reset() 清除缓存
         self.robot.reset(env_ids)
-        
-        # 2. 调用父类的 _reset_idx
         super()._reset_idx(env_ids)
-        
-        # 3. 如果是全部环境重置，设置随机初始episode长度（避免同时重置）
-        if len(env_ids) == self.num_envs:
-            self.episode_length_buf[:] = torch.randint_like(
-                self.episode_length_buf, high=int(self.max_episode_length)
-            )
-        
-        # 4. 重置动作缓存
-        self.previous_actions[env_ids] = 0.0
-        
-        # 5. 随机化目标速度
-        self.target_velocity[env_ids] = sample_uniform(
-            self.cfg.target_velocity_range[0],
-            self.cfg.target_velocity_range[1],
-            (len(env_ids),),
-            device=self.device,
-        )
-        
-        # 6. 准备关节状态（添加随机化）
-        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
-        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
-        joint_pos += sample_uniform(
-            self.cfg.initial_joint_pos_range[0],
-            self.cfg.initial_joint_pos_range[1],
-            joint_pos.shape,
-            device=self.device,
-        )
-        
-        # 7. 准备根状态（加上环境偏移）
-        default_root_state = self.robot.data.default_root_state[env_ids].clone()
-        
-        # 调试输出
-        print(f"\n重置环境 {env_ids.tolist()}")
-        print(f"default_root_state (相对): {default_root_state[:, :3]}")
-        print(f"env_origins: {self.scene.env_origins[env_ids]}")
-        
+
+        joint_pos = self.robot.data.default_joint_pos[env_ids]
+        joint_vel = self.robot.data.default_joint_vel[env_ids]
+        default_root_state = self.robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
-        
-        print(f"default_root_state (绝对): {default_root_state[:, :3]}")
-        
-        # 8. 写入状态到仿真器（关键：这个顺序很重要！）
+
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        
+        # Reset buffers
+        self.last_actions[env_ids] = 0.0
+        self.last_dof_vel[env_ids] = 0.0
+        self.command_timer[env_ids] = 0.0
+        self.commands[env_ids, 0] = sample_uniform(-1.0, 1.0, (len(env_ids),), device=self.device)
+        self.commands[env_ids, 1] = sample_uniform(-0.5, 0.5, (len(env_ids),), device=self.device)
+        self.commands[env_ids, 2] = sample_uniform(-1.0, 1.0, (len(env_ids),), device=self.device)
+        self.commands[env_ids, 3] = sample_uniform(0.1, 0.4, (len(env_ids),), device=self.device)

@@ -172,7 +172,7 @@ def run_simulator(sim: sim_utils.SimulationContext, entities: dict[str, Articula
         # torch.randn_like 生成与关节数量相同的随机数（正态分布）
         # 乘以20.0控制扭矩大小（可以调整这个值）
         efforts = torch.randn_like(robot.data.joint_pos) * 5.0
-        print(f"[Step {count}] Applying random torques: {efforts.cpu().numpy()}")
+        # print(f"[Step {count}] Applying random torques: {efforts.cpu().numpy()}")
 
         
         # 设置关节扭矩目标
