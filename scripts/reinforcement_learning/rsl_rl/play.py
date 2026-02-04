@@ -57,6 +57,9 @@ import gymnasium as gym
 import os
 import time
 import torch
+import weakref
+import carb
+import omni
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -78,6 +81,124 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
+
+
+class KeyboardCommandControl:
+    """Keyboard controller for robot locomotion commands.
+    
+    Key bindings:
+        W/S: Forward/Backward velocity (Vx)
+        A/D: Left/Right velocity (Vy)
+        Z/X: Rotate left/right (Vw - angular velocity)
+        Q/E: Decrease/Increase leg height
+    """
+    
+    def __init__(self, device):
+        """Initialize keyboard command controller.
+        
+        Args:
+            device: The torch device to use for tensors.
+        """
+        self.device = device
+        # Command buffer: [vx, vy, omega_z, height]
+        self._commands = torch.zeros(4, device=device)
+        
+        # Command limits and sensitivities
+        self.vx_limit = 2.0
+        self.vy_limit = 1.0
+        self.omega_limit = 2.0
+        self.height_min = 0.15
+        self.height_max = 0.4
+        
+        self.linear_sensitivity = 0.5  # m/s per press
+        self.angular_sensitivity = 0.5  # rad/s per press
+        self.height_sensitivity = 0.05  # m per press
+        
+        # Set default height
+        self._commands[3] = 0.25  # default height
+        
+        # Setup keyboard interface
+        self._input = carb.input.acquire_input_interface()
+        self._keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+        self._keyboard_sub = self._input.subscribe_to_keyboard_events(
+            self._keyboard,
+            lambda event, *args, obj=weakref.proxy(self): obj._on_keyboard_event(event, *args),
+        )
+        
+        print("\n" + "="*60)
+        print("Keyboard Control Active!")
+        print("="*60)
+        print("W/S: Forward/Backward")
+        print("A/D: Left/Right")
+        print("Z/X: Rotate Left/Right")
+        print("Q/E: Leg Shorter/Longer")
+        print("L:   Reset all commands")
+        print("="*60 + "\n")
+    
+    def _on_keyboard_event(self, event, *args, **kwargs):
+        """Handle keyboard events."""
+        # On key press - add velocity
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            if event.input.name == "L":
+                # Reset all commands
+                self._commands[0:3] = 0.0
+                self._commands[3] = 0.25
+            elif event.input.name == "W":
+                self._commands[0] += self.linear_sensitivity
+            elif event.input.name == "S":
+                self._commands[0] -= self.linear_sensitivity
+            elif event.input.name == "A":
+                self._commands[1] += self.linear_sensitivity
+            elif event.input.name == "D":
+                self._commands[1] -= self.linear_sensitivity
+            elif event.input.name == "Z":
+                self._commands[2] += self.angular_sensitivity
+            elif event.input.name == "X":
+                self._commands[2] -= self.angular_sensitivity
+            elif event.input.name == "Q":
+                self._commands[3] -= self.height_sensitivity
+            elif event.input.name == "E":
+                self._commands[3] += self.height_sensitivity
+        
+        # On key release - remove velocity
+        elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
+            if event.input.name == "W":
+                self._commands[0] -= self.linear_sensitivity
+            elif event.input.name == "S":
+                self._commands[0] += self.linear_sensitivity
+            elif event.input.name == "A":
+                self._commands[1] -= self.linear_sensitivity
+            elif event.input.name == "D":
+                self._commands[1] += self.linear_sensitivity
+            elif event.input.name == "Z":
+                self._commands[2] -= self.angular_sensitivity
+            elif event.input.name == "X":
+                self._commands[2] += self.angular_sensitivity
+        
+        # Clamp commands to limits
+        self._commands[0] = torch.clamp(self._commands[0], -self.vx_limit, self.vx_limit)
+        self._commands[1] = torch.clamp(self._commands[1], -self.vy_limit, self.vy_limit)
+        self._commands[2] = torch.clamp(self._commands[2], -self.omega_limit, self.omega_limit)
+        self._commands[3] = torch.clamp(self._commands[3], self.height_min, self.height_max)
+        
+        return True
+    
+    def get_commands(self, num_envs: int) -> torch.Tensor:
+        """Get current commands for all environments.
+        
+        Args:
+            num_envs: Number of parallel environments.
+            
+        Returns:
+            Tensor of shape (num_envs, 4) with [vx, vy, omega_z, height] for each env.
+        """
+        return self._commands.unsqueeze(0).repeat(num_envs, 1)
+    
+    def cleanup(self):
+        """Cleanup keyboard subscription."""
+        if self._keyboard_sub is not None:
+            self._input.unsubscribe_to_keyboard_events(self._keyboard, self._keyboard_sub)
+            self._keyboard_sub = None
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -174,12 +295,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
+    # Setup keyboard control for commands
+    keyboard_control = KeyboardCommandControl(env.unwrapped.device)
+    
     # reset environment
     obs = env.get_observations()
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
+        
+        # Update environment commands from keyboard
+        if hasattr(env.unwrapped, 'commands'):
+            env.unwrapped.commands[:] = keyboard_control.get_commands(env.unwrapped.num_envs)
+        
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
@@ -199,6 +328,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
+    # cleanup
+    keyboard_control.cleanup()
     # close the simulator
     env.close()
 

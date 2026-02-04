@@ -117,6 +117,7 @@ class WbrRLEnv(DirectRLEnv):
             "tracking_liny_sigma": 0.25,
             "tracking_ang_sigma": 0.25,
             "tracking_height_sigma": 0.1,
+            "tracking_similar_legged_sigma": 0.5,
             "feet_distance": [0.2, 0.5], # [min, max]
             "tracking_gravity_sigma": 0.1
         })
@@ -166,13 +167,13 @@ class WbrRLEnv(DirectRLEnv):
         
         if len(resample_ids) > 0:
             # Vx (Forward)
-            self.commands[resample_ids, 0] = sample_uniform(-1.0, 1.0, (len(resample_ids),), device=self.device)
+            self.commands[resample_ids, 0] = sample_uniform(self.cfg.vx_cmd_range[0], self.cfg.vx_cmd_range[1], (len(resample_ids),), device=self.device)
             # Vy (Lateral)
-            self.commands[resample_ids, 1] = sample_uniform(-0.5, 0.5, (len(resample_ids),), device=self.device)
+            self.commands[resample_ids, 1] = sample_uniform(self.cfg.vy_cmd_range[0], self.cfg.vy_cmd_range[1], (len(resample_ids),), device=self.device)
             # Omega Z (Yaw)
-            self.commands[resample_ids, 2] = sample_uniform(-1.5, 1.5, (len(resample_ids),), device=self.device)
+            self.commands[resample_ids, 2] = sample_uniform(self.cfg.wz_cmd_range[0], self.cfg.wz_cmd_range[1], (len(resample_ids),), device=self.device)
             # Height (Z) - Adjust range based on your robot size
-            self.commands[resample_ids, 3] = sample_uniform(0.1, 0.4, (len(resample_ids),), device=self.device)
+            self.commands[resample_ids, 3] = sample_uniform(self.cfg.height_cmd_range[0], self.cfg.height_cmd_range[1], (len(resample_ids),), device=self.device)
             
             if self.command_cfg["zero_stable"]:
                 zero_mask = torch.rand(len(resample_ids), device=self.device) < 0.2
@@ -203,19 +204,33 @@ class WbrRLEnv(DirectRLEnv):
              self.left_foot_pos = self.robot.data.body_pos_w[:, self.left_foot_body_idx[0], :]
              self.right_foot_pos = self.robot.data.body_pos_w[:, self.right_foot_body_idx[0], :]
 
+
         # 4. Construct Observation Vector
         obs = torch.cat(
             (
-                self.base_lin_vel * 2.0,      # Scale for network stability
-                self.base_ang_vel * 0.25,
+                self.base_lin_vel * 1.0,      # 减小scaling让网络更容易学习速度
+                self.base_ang_vel * 0.5,      # 稍微增加角速度scale
                 self.projected_gravity,
-                self.commands * 2.0,          # [vx, vy, wz, h]
+                self.commands[:, :3] * 1.0,   # 速度命令不过度缩放
+                self.commands[:, 3:] * 2.0,   # 高度命令保持缩放
                 (self.dof_pos - self.robot.data.default_joint_pos) * 1.0,
                 torch.clamp(self.dof_vel * 0.05, -5.0, 5.0),  # Clamp to prevent explosion
                 self.actions                  # Last actions
             ),
             dim=-1,
         )
+
+        # # DEBUG: Print observations for env 0
+        # if self.episode_length_buf[0] % 100 == 0:
+        #     print("-" * 30)
+        #     print(f"DEBUG OBS [Env 0] Loop {self.episode_length_buf[0]}")
+        #     print(f"  Base Lin Vel: {self.base_lin_vel[0].cpu().numpy()}")
+        #     print(f"  Base Ang Vel: {self.base_ang_vel[0].cpu().numpy()}")
+        #     print(f"  Projected Grav: {self.projected_gravity[0].cpu().numpy()}")
+        #     print(f"  Commands: {self.commands[0].cpu().numpy()}")
+        #     print(f"  DOF Pos Err: {(self.dof_pos[0] - self.robot.data.default_joint_pos[0]).cpu().numpy()}")
+        #     print(f"  DOF Vel: {self.dof_vel[0].cpu().numpy()}")
+        #     print("-" * 30)
         
         return {"policy": obs}
 
@@ -242,23 +257,24 @@ class WbrRLEnv(DirectRLEnv):
         rew_feet_dist = self._reward_feet_distance()
         rew_calf_sym = self._reward_similar_calf()
 
-        # Summation (Rewards rescaled to keep total per-step reward around -1 to +1)
+        # Summation - Weights from config
         total_reward = (
-            rew_lin_x * 0.15 +
-            rew_lin_y * 0.10 + 
-            rew_ang_z * 0.08 + 
-            rew_height * 0.12 +
-            # Penalties (Subtracted)
-            rew_projected_gravity * -0.15 +
-            rew_lin_z * -0.25 +
-            rew_ang_xy * -0.05 +
-            rew_joint_acc * -0.005 +
-            rew_wheel_acc * -0.005 +
-            rew_dof_acc * -1.0e-7 + 
-            rew_dof_vel * -0.0005 +
-            rew_collision * -0.1 +
-            rew_calf_sym * -0.08 +
-            rew_feet_dist * -0.1
+            # Tracking rewards (positive)
+            rew_lin_x * self.cfg.rew_scale_lin_x +
+            rew_lin_y * self.cfg.rew_scale_lin_y + 
+            rew_ang_z * self.cfg.rew_scale_ang_z + 
+            rew_height * self.cfg.rew_scale_height +
+            # Penalties (negative weights)
+            rew_projected_gravity * self.cfg.rew_scale_projected_gravity +
+            rew_lin_z * self.cfg.rew_scale_lin_z +
+            rew_ang_xy * self.cfg.rew_scale_ang_xy +
+            rew_joint_acc * self.cfg.rew_scale_joint_acc +
+            rew_wheel_acc * self.cfg.rew_scale_wheel_acc +
+            rew_dof_acc * self.cfg.rew_scale_dof_acc + 
+            rew_dof_vel * self.cfg.rew_scale_dof_vel +
+            rew_collision * self.cfg.rew_scale_collision +
+            rew_calf_sym * self.cfg.rew_scale_calf_sym +
+            rew_feet_dist * self.cfg.rew_scale_feet_dist
         )
         
         # Apply death cost
@@ -267,6 +283,18 @@ class WbrRLEnv(DirectRLEnv):
             torch.ones_like(total_reward) * self.cfg.death_cost, 
             total_reward
         )
+
+        # DEBUG: Print rewards for env 0
+        if self.episode_length_buf[0] % 100 == 0:
+            print(f"DEBUG REWARD [Env 0]")
+            print(f"  rew_lin_x: {rew_lin_x[0].item():.4f} * 1.5 = {rew_lin_x[0].item() * 1.5:.4f}")
+            print(f"  rew_ang_z: {rew_ang_z[0].item():.4f} * 0.5 = {rew_ang_z[0].item() * 0.5:.4f}")
+            print(f"  rew_height: {rew_height[0].item():.4f} * -5.0 = {rew_height[0].item() * -5.0:.4f}")
+            print(f"  rew_projected_gravity: {rew_projected_gravity[0].item():.4f} * -50.0 = {rew_projected_gravity[0].item() * -50.0:.4f}")
+            print(f"  rew_calf_sym: {rew_calf_sym[0].item():.4f} * 0.5 = {rew_calf_sym[0].item() * 0.5:.4f}")
+            print(f"  rew_collision: {rew_collision[0].item():.4f}")
+            print(f"  TOTAL: {total_reward[0].item():.4f}")
+            print("-" * 30)
         
         return total_reward
 
@@ -293,11 +321,11 @@ class WbrRLEnv(DirectRLEnv):
         return ang_vel_reward
 
     def _reward_tracking_leg_length(self):
-        # Uses leg joint indices (Indices relative to full robot state)
-        # Note: adjust index offset [1]/[3] if your 'Left_rear_joint' etc order is different
-        knee_error = torch.square(self.dof_pos[:, self.leg_dof_indices[1]] - self.commands[:, 3])
-        knee_error += torch.square(self.dof_pos[:, self.leg_dof_indices[3]] - self.commands[:, 3])
-        return torch.exp(-knee_error / self.reward_cfg["tracking_height_sigma"])
+        # Base link 高度跟踪 (Base link height tracking)
+        # Tracks actual base link z-position against command height
+        base_height = self.robot.data.root_pos_w[:, 2]
+        height_error = torch.square(base_height - self.commands[:, 3])
+        return height_error
 
     def _reward_lin_vel_z(self):
         return torch.square(self.base_lin_vel[:, 2])
@@ -318,9 +346,12 @@ class WbrRLEnv(DirectRLEnv):
         return reward
     
     def _reward_similar_calf(self):
-        # Uses global joint positions, so 'leg_dof_indices' is correct here
-        rew = torch.square(self.dof_pos[:, self.leg_dof_indices[0]] - self.dof_pos[:, self.leg_dof_indices[2]])
-        return rew
+        # 两侧腿相似 (Similar legs) - using exp like Genesis to encourage symmetry
+        # Compares left and right leg joints
+        legged_error = torch.sum(torch.abs(torch.pow(
+            self.dof_pos[:, self.leg_dof_indices[0:2]] - self.dof_pos[:, self.leg_dof_indices[2:4]], 3
+        )), dim=1)
+        return torch.exp(-legged_error / self.reward_cfg.get("tracking_similar_legged_sigma", 0.5))
 
     def _reward_joint_vel(self):
         # Uses global joint velocities, so 'leg_dof_indices' is correct here
@@ -357,6 +388,19 @@ class WbrRLEnv(DirectRLEnv):
     
     def _reward_survive(self):
         return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+    
+    def _reward_tsk(self):
+        # 铁山靠 (Tie Shan Kao) - Hip position tracking for lateral motion
+        # Uses front leg joints (indices 0 and 2)
+        tsk_err = self.dof_pos[:, self.leg_dof_indices[0]] - self.commands[:, 3]
+        tsk_err += self.dof_pos[:, self.leg_dof_indices[2]] - self.commands[:, 3]
+        return torch.square(tsk_err)
+    
+    def _reward_dof_force(self):
+        # Penalize high joint forces
+        # Note: IsaacLab uses joint_applied_torque or similar
+        joint_efforts = self.robot.data.applied_torque[:, self._joint_dof_idx]
+        return torch.sum(torch.square(joint_efforts), dim=1)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -382,7 +426,7 @@ class WbrRLEnv(DirectRLEnv):
         self.last_actions[env_ids] = 0.0
         self.last_dof_vel[env_ids] = 0.0
         self.command_timer[env_ids] = 0.0
-        self.commands[env_ids, 0] = sample_uniform(-1.0, 1.0, (len(env_ids),), device=self.device)
-        self.commands[env_ids, 1] = sample_uniform(-0.5, 0.5, (len(env_ids),), device=self.device)
-        self.commands[env_ids, 2] = sample_uniform(-1.0, 1.0, (len(env_ids),), device=self.device)
-        self.commands[env_ids, 3] = sample_uniform(0.1, 0.4, (len(env_ids),), device=self.device)
+        self.commands[env_ids, 0] = sample_uniform(self.cfg.vx_cmd_range[0], self.cfg.vx_cmd_range[1], (len(env_ids),), device=self.device)
+        self.commands[env_ids, 1] = sample_uniform(self.cfg.vy_cmd_range[0], self.cfg.vy_cmd_range[1], (len(env_ids),), device=self.device)
+        self.commands[env_ids, 2] = sample_uniform(self.cfg.wz_cmd_range[0], self.cfg.wz_cmd_range[1], (len(env_ids),), device=self.device)
+        self.commands[env_ids, 3] = sample_uniform(self.cfg.height_cmd_range[0], self.cfg.height_cmd_range[1], (len(env_ids),), device=self.device)
