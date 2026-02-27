@@ -117,6 +117,10 @@ class KeyboardCommandControl:
         # Set default height
         self._commands[3] = 0.25  # default height
         
+        # Debug counter
+        self._debug_counter = 0
+        self._last_key_pressed = None
+        
         # Setup keyboard interface
         self._input = carb.input.acquire_input_interface()
         self._keyboard = omni.appwindow.get_default_app_window().get_keyboard()
@@ -137,12 +141,19 @@ class KeyboardCommandControl:
     
     def _on_keyboard_event(self, event, *args, **kwargs):
         """Handle keyboard events."""
+        key_name = event.input if isinstance(event.input, str) else event.input.name
+        event_type = "PRESS" if event.type == carb.input.KeyboardEventType.KEY_PRESS else "RELEASE"
+        
         # On key press - add velocity
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            print(f"[KEYBOARD] Key {event_type}: {key_name}")
+            self._last_key_pressed = key_name
+            
             if event.input.name == "L":
                 # Reset all commands
                 self._commands[0:3] = 0.0
                 self._commands[3] = 0.25
+                print(f"[KEYBOARD] RESET - Commands: Vx=0.0, Vy=0.0, Vw=0.0, Height=0.25")
             elif event.input.name == "W":
                 self._commands[0] += self.linear_sensitivity
             elif event.input.name == "S":
@@ -181,6 +192,12 @@ class KeyboardCommandControl:
         self._commands[2] = torch.clamp(self._commands[2], -self.omega_limit, self.omega_limit)
         self._commands[3] = torch.clamp(self._commands[3], self.height_min, self.height_max)
         
+        # Print updated commands after clamping
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS and key_name in ["W", "S", "A", "D", "Z", "X", "Q", "E"]:
+            print(f"[KEYBOARD] Updated Commands -> Vx={self._commands[0].item():.3f}, "
+                  f"Vy={self._commands[1].item():.3f}, Vw={self._commands[2].item():.3f}, "
+                  f"Height={self._commands[3].item():.3f}")
+        
         return True
     
     def get_commands(self, num_envs: int) -> torch.Tensor:
@@ -192,6 +209,17 @@ class KeyboardCommandControl:
         Returns:
             Tensor of shape (num_envs, 4) with [vx, vy, omega_z, height] for each env.
         """
+        # Print debug info every 100 calls
+        self._debug_counter += 1
+        if self._debug_counter % 100 == 0:
+            print(f"\n[DEBUG] Step {self._debug_counter} - Current Commands sent to robot:")
+            print(f"  Vx (forward/back): {self._commands[0].item():+.3f} m/s")
+            print(f"  Vy (left/right):   {self._commands[1].item():+.3f} m/s")
+            print(f"  Vw (rotation):     {self._commands[2].item():+.3f} rad/s")
+            print(f"  Height:            {self._commands[3].item():.3f} m")
+            if self._last_key_pressed:
+                print(f"  Last key pressed:  {self._last_key_pressed}\n")
+        
         return self._commands.unsqueeze(0).repeat(num_envs, 1)
     
     def cleanup(self):
@@ -298,6 +326,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Setup keyboard control for commands
     keyboard_control = KeyboardCommandControl(env.unwrapped.device)
     
+    # Disable automatic command resampling to allow manual control
+    if hasattr(env.unwrapped, 'command_cfg'):
+        env.unwrapped.command_cfg["resampling_time"] = float('inf')  # Never resample
+        print("[INFO] Disabled automatic command resampling for keyboard control")
+    
     # reset environment
     obs = env.get_observations()
     timestep = 0
@@ -305,9 +338,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     while simulation_app.is_running():
         start_time = time.time()
         
-        # Update environment commands from keyboard
+        # Update environment commands from keyboard (BEFORE stepping)
         if hasattr(env.unwrapped, 'commands'):
-            env.unwrapped.commands[:] = keyboard_control.get_commands(env.unwrapped.num_envs)
+            keyboard_commands = keyboard_control.get_commands(env.unwrapped.num_envs)
+            env.unwrapped.commands[:] = keyboard_commands
+            # Also reset the command timer to prevent auto-resampling
+            if hasattr(env.unwrapped, 'command_timer'):
+                env.unwrapped.command_timer[:] = 0.0
         
         # run everything in inference mode
         with torch.inference_mode():

@@ -122,7 +122,7 @@ class WbrRLEnv(DirectRLEnv):
             "tracking_gravity_sigma": 0.1
         })
         self.command_cfg = getattr(self.cfg, "command_params", {
-            "zero_stable": True,
+            "zero_stable": False,
             "resampling_time": 4.0
         })
 
@@ -287,10 +287,10 @@ class WbrRLEnv(DirectRLEnv):
         # DEBUG: Print rewards for env 0
         if self.episode_length_buf[0] % 100 == 0:
             print(f"DEBUG REWARD [Env 0]")
-            print(f"  rew_lin_x: {rew_lin_x[0].item():.4f} * 1.5 = {rew_lin_x[0].item() * 1.5:.4f}")
-            print(f"  rew_ang_z: {rew_ang_z[0].item():.4f} * 0.5 = {rew_ang_z[0].item() * 0.5:.4f}")
+            print(f"  rew_lin_x: {rew_lin_x[0].item():.4f} * 1.0 = {rew_lin_x[0].item() * 1.0:.4f}")
+            print(f"  rew_ang_z: {rew_ang_z[0].item():.4f} * 1.0 = {rew_ang_z[0].item() * 1.0:.4f}")
             print(f"  rew_height: {rew_height[0].item():.4f} * -5.0 = {rew_height[0].item() * -5.0:.4f}")
-            print(f"  rew_projected_gravity: {rew_projected_gravity[0].item():.4f} * -50.0 = {rew_projected_gravity[0].item() * -50.0:.4f}")
+            print(f"  rew_projected_gravity: {rew_projected_gravity[0].item():.4f} * -40.0 = {rew_projected_gravity[0].item() * -40.0:.4f}")
             print(f"  rew_calf_sym: {rew_calf_sym[0].item():.4f} * 0.5 = {rew_calf_sym[0].item() * 0.5:.4f}")
             print(f"  rew_collision: {rew_collision[0].item():.4f}")
             print(f"  TOTAL: {total_reward[0].item():.4f}")

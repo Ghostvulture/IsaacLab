@@ -89,11 +89,11 @@ class WbrRLEnvCfg(DirectRLEnvCfg):
     height_cmd_range: tuple = (0.15, 0.4)  # Height command range
 
     # Reward scales
-    rew_scale_lin_x: float = 0.5
-    rew_scale_lin_y: float = 0.5
-    rew_scale_ang_z: float = 0.5
+    rew_scale_lin_x: float = 1.0
+    rew_scale_lin_y: float = 0.0 #prohibited
+    rew_scale_ang_z: float = 1.0
     rew_scale_height: float = -5.0
-    rew_scale_projected_gravity: float = -60.0
+    rew_scale_projected_gravity: float = -40.0
     rew_scale_lin_z: float = -2.0
     rew_scale_ang_xy: float = -0.05
     rew_scale_joint_acc: float = -2.5e-7
